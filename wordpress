@@ -23,6 +23,8 @@ services:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot"]
       timeout: 5s
       retries: 10
+    volumes:
+      - db_data:/var/lib/mysql
 
   wordpress:
     image: wordpress:latest
@@ -37,8 +39,24 @@ services:
       WORDPRESS_DB_USER: wordpress
       WORDPRESS_DB_PASSWORD: wordpress
       WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_DEBUG', false);
+        define('DISALLOW_FILE_EDIT', true);
+        define('WP_AUTO_UPDATE_CORE', false);
+        define('FS_METHOD', 'direct');
     volumes:
       - ./app:/var/www/html
+      - ./uploads.ini:/usr/local/etc/php/conf.d/uploads.ini
+
+volumes:
+  db_data:
+"""
+
+UPLOADS_INI = """upload_max_filesize = 256M
+post_max_size = 256M
+max_execution_time = 300
+max_input_time = 300
+memory_limit = 512M
 """
 
 def check_dependencies():
@@ -63,6 +81,10 @@ def create_site(name, port, force_pull=False):
         os.makedirs(os.path.join(path, "app"), exist_ok=True)
         with open(os.path.join(path, "docker-compose.yml"), "w") as f:
             f.write(COMPOSE_TEMPLATE.format(port=port))
+        with open(os.path.join(path, "uploads.ini"), "w") as f:
+            f.write(UPLOADS_INI)
+
+        subprocess.run(["sudo", "chown", "33:33", os.path.join(path, "app")], check=True)
         
         if force_pull:
             print("📦 Pulling fresh images...")
@@ -78,7 +100,8 @@ def create_site(name, port, force_pull=False):
             docker exec -u 0 {container_name} curl -s -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && \
             docker exec -u 0 {container_name} chmod +x wp-cli.phar && \
             docker exec -u 0 {container_name} mv wp-cli.phar /usr/local/bin/wp && \
-            docker exec {container_name} wp core install --url=http://localhost:{port} --title='{name.capitalize()}' --admin_user=admin --admin_password=admin --admin_email=admin@example.com --allow-root
+            docker exec {container_name} wp core install --url=http://localhost:{port} --title='{name.capitalize()}' --admin_user=admin --admin_password=admin --admin_email=admin@example.com --allow-root && \
+            docker exec -u 0 {container_name} chown -R www-data:www-data /var/www/html
         """
         subprocess.run(setup_script, shell=True, check=True)
         print(f"\n✨ SUCCESS! http://localhost:{port} (admin/admin)")

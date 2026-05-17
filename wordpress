@@ -6,6 +6,8 @@ import shutil
 import argparse
 import time
 import re
+import json
+from datetime import datetime
 
 BASE_DIR = os.path.expanduser("~/.local/share/wordpress-lab/sites")
 
@@ -62,86 +64,32 @@ memory_limit = 512M
 def check_dependencies():
     for tool in ["docker", "curl"]:
         if shutil.which(tool) is None:
-            print(f"❌ Error: '{tool}' is not installed.")
+            print(f"Error: '{tool}' is not installed.")
             sys.exit(1)
     try:
         subprocess.run(["docker", "compose", "version"], capture_output=True, check=True)
     except:
-        print("❌ Error: 'docker compose' (V2) is not available.")
+        print("Error: 'docker compose' (V2) is not available.")
         sys.exit(1)
 
-def create_site(name, port, force_pull=False):
-    path = os.path.join(BASE_DIR, name)
-    if os.path.exists(path):
-        print(f"❌ Error: Site '{name}' already exists.")
-        return
-    
-    print(f"🚀 Initializing '{name}' on port {port}...")
-    try:
-        os.makedirs(os.path.join(path, "app"), exist_ok=True)
-        with open(os.path.join(path, "docker-compose.yml"), "w") as f:
-            f.write(COMPOSE_TEMPLATE.format(port=port))
-        with open(os.path.join(path, "uploads.ini"), "w") as f:
-            f.write(UPLOADS_INI)
+def get_container_name(name, service="wordpress"):
+    res = subprocess.run(
+        ["docker", "compose", "-p", name, "ps", "--format", "json"],
+        cwd=os.path.join(BASE_DIR, name), capture_output=True, text=True
+    )
+    for line in res.stdout.strip().splitlines():
+        try:
+            data = json.loads(line)
+            if data.get("Service") == service:
+                return data.get("Name")
+        except: pass
+    return f"{name}-{service}-1"
 
-        subprocess.run(["sudo", "chown", "33:33", os.path.join(path, "app")], check=True)
-        
-        if force_pull:
-            print("📦 Pulling fresh images...")
-            subprocess.run(["docker", "compose", "-p", name, "pull"], cwd=path, check=True)
-        
-        subprocess.run(["docker", "compose", "-p", name, "up", "-d", "--pull", "missing"], cwd=path, check=True)
-        
-        print("⏳ Waiting for setup (30s)...")
-        time.sleep(20)
+def site_path(name):
+    return os.path.join(BASE_DIR, name)
 
-        container_name = f"{name}-wordpress-1"
-        setup_script = f"""
-            docker exec -u 0 {container_name} curl -s -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && \
-            docker exec -u 0 {container_name} chmod +x wp-cli.phar && \
-            docker exec -u 0 {container_name} mv wp-cli.phar /usr/local/bin/wp && \
-            docker exec {container_name} wp core install --url=http://localhost:{port} --title='{name.capitalize()}' --admin_user=admin --admin_password=admin --admin_email=admin@example.com --allow-root && \
-            docker exec -u 0 {container_name} chown -R www-data:www-data /var/www/html
-        """
-        subprocess.run(setup_script, shell=True, check=True)
-        print(f"\n✨ SUCCESS! http://localhost:{port} (admin/admin)")
-    except Exception as e:
-        print(f"❌ Failed: {e}")
-
-def start_site(name):
-    path = os.path.join(BASE_DIR, name)
-    if not os.path.exists(path):
-        print(f"❌ Error: Site '{name}' not found.")
-        return
-    try:
-        subprocess.run(["docker", "compose", "-p", name, "up", "-d"], cwd=path, check=True)
-        print(f"✅ Started '{name}'.")
-    except Exception as e:
-        print(f"❌ Error: {e}")
-
-def stop_site(name):
-    path = os.path.join(BASE_DIR, name)
-    if not os.path.exists(path):
-        print(f"❌ Error: Site '{name}' not found.")
-        return
-    try:
-        subprocess.run(["docker", "compose", "-p", name, "down"], cwd=path, check=True)
-        print(f"✅ Stopped '{name}'.")
-    except Exception as e:
-        print(f"❌ Error: {e}")
-
-def delete_site(name):
-    path = os.path.join(BASE_DIR, name)
-    if not os.path.exists(path):
-        print(f"❌ Error: Site '{name}' not found.")
-        return
-    if input(f"⚠️ Confirm delete '{name}'? (y/N): ").lower() != 'y': return
-    try:
-        subprocess.run(["docker", "compose", "-p", name, "down", "-v"], cwd=path, check=True)
-        subprocess.run(["sudo", "rm", "-rf", path], check=True)
-        print(f"✅ Deleted '{name}'.")
-    except Exception as e:
-        print(f"❌ Error: {e}")
+def site_exists(name):
+    return os.path.exists(site_path(name))
 
 def get_site_port(path):
     compose_path = os.path.join(path, "docker-compose.yml")
@@ -153,42 +101,321 @@ def get_site_port(path):
             return match.group(1) if match else "???"
     except: return "???"
 
-def list_sites():
-    if not os.path.exists(BASE_DIR): return
-    sites = sorted(os.listdir(BASE_DIR))
-    if not sites:
-        print("📭 No sites found.")
+def get_site_status(name):
+    path = site_path(name)
+    if not os.path.exists(path): return "Not found"
+    try:
+        res = subprocess.run(["docker", "compose", "-p", name, "ps", "--format", "json"],
+                            cwd=path, capture_output=True, text=True)
+        if "running" in res.stdout.lower():
+            return "Running"
+        if res.stdout.strip():
+            return "Stopped"
+        return "Not created"
+    except: return "Unknown"
+
+# === COMMANDS ===
+
+def cmd_create(name, port, force_pull=False):
+    path = site_path(name)
+    if os.path.exists(path):
+        print(f"Error: Site '{name}' already exists.")
         return
 
-    print(f"{'SITE NAME':<20} {'PORT':<10} {'STATUS'}")
-    print("-" * 45)
+    print(f"Initializing '{name}' on port {port}...")
+    try:
+        os.makedirs(os.path.join(path, "app"), exist_ok=True)
+        with open(os.path.join(path, "docker-compose.yml"), "w") as f:
+            f.write(COMPOSE_TEMPLATE.format(port=port))
+        with open(os.path.join(path, "uploads.ini"), "w") as f:
+            f.write(UPLOADS_INI)
+
+        subprocess.run(["sudo", "chown", "33:33", os.path.join(path, "app")], check=True)
+
+        if force_pull:
+            print("Pulling fresh images...")
+            subprocess.run(["docker", "compose", "-p", name, "pull"], cwd=path, check=True)
+
+        subprocess.run(["docker", "compose", "-p", name, "up", "-d", "--pull", "missing"], cwd=path, check=True)
+
+        print("Waiting for setup (30s)...")
+        time.sleep(20)
+
+        container = get_container_name(name)
+        setup = "; ".join([
+            f"docker exec -u 0 {container} curl -s -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar",
+            f"docker exec -u 0 {container} chmod +x wp-cli.phar",
+            f"docker exec -u 0 {container} mv wp-cli.phar /usr/local/bin/wp",
+            f"docker exec {container} wp core install --url=http://localhost:{port} --title='{name.capitalize()}' --admin_user=admin --admin_password=admin --admin_email=admin@example.com --allow-root",
+            f"docker exec -u 0 {container} chown -R www-data:www-data /var/www/html"
+        ])
+        subprocess.run(setup, shell=True, check=True)
+        print(f"\nSUCCESS! http://localhost:{port} (admin / admin)")
+    except Exception as e:
+        print(f"Failed: {e}")
+
+def cmd_start(name):
+    if not site_exists(name):
+        print(f"Error: Site '{name}' not found.")
+        return
+    try:
+        subprocess.run(["docker", "compose", "-p", name, "up", "-d", "--pull", "missing"], cwd=site_path(name), check=True)
+        print(f"Started '{name}'.")
+    except Exception as e:
+        print(f"Error: {e}")
+
+def cmd_stop(name):
+    if not site_exists(name):
+        print(f"Error: Site '{name}' not found.")
+        return
+    try:
+        subprocess.run(["docker", "compose", "-p", name, "down"], cwd=site_path(name), check=True)
+        print(f"Stopped '{name}'.")
+    except Exception as e:
+        print(f"Error: {e}")
+
+def cmd_restart(name):
+    cmd_stop(name)
+    cmd_start(name)
+
+def cmd_delete(name):
+    if not site_exists(name):
+        print(f"Error: Site '{name}' not found.")
+        return
+    if input(f"Confirm delete '{name}'? (y/N): ").lower() != 'y': return
+    try:
+        subprocess.run(["docker", "compose", "-p", name, "down", "-v"], cwd=site_path(name), check=True)
+        subprocess.run(["sudo", "rm", "-rf", site_path(name)], check=True)
+        print(f"Deleted '{name}'.")
+    except Exception as e:
+        print(f"Error: {e}")
+
+def cmd_list():
+    if not os.path.exists(BASE_DIR):
+        print("No sites found.")
+        return
+    sites = sorted(os.listdir(BASE_DIR))
+    if not sites:
+        print("No sites found.")
+        return
+    print(f"{'SITE':<20} {'PORT':<10} {'STATUS'}")
+    print("-" * 42)
     for name in sites:
-        path = os.path.join(BASE_DIR, name)
+        path = site_path(name)
+        if not os.path.isdir(path): continue
         port = get_site_port(path)
-        status = "🔴 Stopped"
-        try:
-            res = subprocess.run(["docker", "compose", "-p", name, "ps", "--format", "json"], 
-                                cwd=path, capture_output=True, text=True)
-            if "running" in res.stdout.lower():
-                status = "🟢 Running"
-        except: pass
+        status = get_site_status(name)
         print(f"{name:<20} {port:<10} {status}")
+
+def cmd_info(name):
+    if not site_exists(name):
+        print(f"Error: Site '{name}' not found.")
+        return
+    path = site_path(name)
+    port = get_site_port(path)
+    status = get_site_status(name)
+    print(f"Name:     {name}")
+    print(f"Port:     {port}")
+    print(f"URL:      http://localhost:{port}")
+    print(f"Status:   {status}")
+    print(f"Path:     {path}")
+    print(f"App:      {path}/app")
+    if status == "Running":
+        wc = get_container_name(name, "wordpress")
+        dc = get_container_name(name, "db")
+        try:
+            wp_id = subprocess.run(["docker", "inspect", "-f", "{{.ID}}", wc], capture_output=True, text=True).stdout.strip()[:12]
+            db_id = subprocess.run(["docker", "inspect", "-f", "{{.ID}}", dc], capture_output=True, text=True).stdout.strip()[:12]
+            print(f"WP:       {wp_id} ({wc})")
+            print(f"DB:       {db_id} ({dc})")
+        except: pass
+    print(f"Admin:    admin / admin")
+
+def cmd_shell(name, service="wordpress"):
+    if not site_exists(name):
+        print(f"Error: Site '{name}' not found.")
+        return
+    container = get_container_name(name, service)
+    print(f"Opening shell in '{container}'...")
+    subprocess.run(["docker", "exec", "-it", container, "bash"], check=False)
+
+def cmd_logs(name, service="wordpress", follow=False, tail=50):
+    if not site_exists(name):
+        print(f"Error: Site '{name}' not found.")
+        return
+    container = get_container_name(name, service)
+    cmd = ["docker", "logs"]
+    if follow: cmd.append("--follow")
+    cmd.extend(["--tail", str(tail), container])
+    subprocess.run(cmd, check=False)
+
+def cmd_wp(name, args_str):
+    if not site_exists(name):
+        print(f"Error: Site '{name}' not found.")
+        return
+    container = get_container_name(name, "wordpress")
+    subprocess.run(["docker", "exec", container, "wp"] + args_str, check=False)
+
+def cmd_db_export(name):
+    if not site_exists(name):
+        print(f"Error: Site '{name}' not found.")
+        return
+    container = get_container_name(name, "db")
+    backup_dir = site_path(name)
+    filename = f"backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.sql"
+    outpath = os.path.join(backup_dir, filename)
+    with open(outpath, "w") as f:
+        subprocess.run(
+            ["docker", "exec", container, "mariadb-dump", "-uwordpress", "-pwordpress", "wordpress"],
+            stdout=f, check=True
+        )
+    subprocess.run(["sudo", "chown", "33:33", outpath], check=False)
+    print(f"Exported to {outpath}")
+
+def cmd_db_import(name, filepath):
+    if not site_exists(name):
+        print(f"Error: Site '{name}' not found.")
+        return
+    if not os.path.exists(filepath):
+        print(f"Error: File '{filepath}' not found.")
+        return
+    container = get_container_name(name, "db")
+    with open(filepath, "r") as f:
+        subprocess.run(
+            ["docker", "exec", "-i", container, "mariadb", "-uwordpress", "-pwordpress", "wordpress"],
+            stdin=f, check=True
+        )
+    print(f"Imported from {filepath}")
+
+def cmd_backup(name):
+    if not site_exists(name):
+        print(f"Error: Site '{name}' not found.")
+        return
+    path = site_path(name)
+    backup_dir = os.path.join(path, "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    db_file = os.path.join(backup_dir, f"db-{ts}.sql")
+    dc = get_container_name(name, "db")
+    with open(db_file, "w") as f:
+        subprocess.run(
+            ["docker", "exec", dc, "mariadb-dump", "-uwordpress", "-pwordpress", "wordpress"],
+            stdout=f, check=True
+        )
+
+    site_file = os.path.join(backup_dir, f"site-{ts}.tar.gz")
+    subprocess.run(["sudo", "tar", "-czf", site_file, "-C", path, "app"], check=True)
+    subprocess.run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", backup_dir], check=True)
+    print(f"Backup saved: {backup_dir}")
+
+def cmd_ps(name):
+    if not site_exists(name):
+        print(f"Error: Site '{name}' not found.")
+        return
+    path = site_path(name)
+    subprocess.run(["docker", "compose", "-p", name, "ps"], cwd=path, check=False)
+
+def cmd_port(name, new_port):
+    if not site_exists(name):
+        print(f"Error: Site '{name}' not found.")
+        return
+    path = site_path(name)
+    compose_file = os.path.join(path, "docker-compose.yml")
+    if not os.path.exists(compose_file):
+        print("Error: docker-compose.yml not found.")
+        return
+    try:
+        with open(compose_file, "r") as f:
+            content = f.read()
+        content = re.sub(r'["\'](\d+):80["\']', f'"{new_port}:80"', content)
+        with open(compose_file, "w") as f:
+            f.write(content)
+        print(f"Port changed to {new_port}. Restart the site for changes to take effect.")
+    except Exception as e:
+        print(f"Error: {e}")
 
 def main():
     check_dependencies()
-    parser = argparse.ArgumentParser(description="Wordpress Ultimate Manager")
+    parser = argparse.ArgumentParser(description="WordPress CLI Manager")
     subparsers = parser.add_subparsers(dest="command")
-    c = subparsers.add_parser("create"); c.add_argument("name"); c.add_argument("port", type=int); c.add_argument("-f", "--force-pull", action="store_true", help="force pull fresh container images")
-    d = subparsers.add_parser("delete"); d.add_argument("name")
-    s = subparsers.add_parser("start"); s.add_argument("name")
-    st = subparsers.add_parser("stop"); st.add_argument("name")
-    subparsers.add_parser("list")
+
+    p_create = subparsers.add_parser("create", help="Create a new WordPress site")
+    p_create.add_argument("name", help="Site name")
+    p_create.add_argument("port", type=int, help="Port number")
+    p_create.add_argument("-f", "--force-pull", action="store_true", help="Force pull fresh images")
+
+    p_start = subparsers.add_parser("start", help="Start a site")
+    p_start.add_argument("name")
+
+    p_stop = subparsers.add_parser("stop", help="Stop a site")
+    p_stop.add_argument("name")
+
+    p_restart = subparsers.add_parser("restart", help="Restart a site")
+    p_restart.add_argument("name")
+
+    p_delete = subparsers.add_parser("delete", help="Delete a site")
+    p_delete.add_argument("name")
+
+    p_list = subparsers.add_parser("list", help="List all sites")
+
+    p_info = subparsers.add_parser("info", help="Show site details")
+    p_info.add_argument("name")
+
+    p_shell = subparsers.add_parser("shell", help="Open shell in a container")
+    p_shell.add_argument("name")
+    p_shell.add_argument("-s", "--service", default="wordpress", choices=["wordpress", "db"], help="Container service")
+
+    p_logs = subparsers.add_parser("logs", help="View container logs")
+    p_logs.add_argument("name")
+    p_logs.add_argument("-s", "--service", default="wordpress", choices=["wordpress", "db"])
+    p_logs.add_argument("-f", "--follow", action="store_true", help="Follow logs")
+    p_logs.add_argument("-n", "--lines", type=int, default=50, help="Number of lines")
+
+    p_wp = subparsers.add_parser("wp", help="Run wp-cli command")
+    p_wp.add_argument("name")
+    p_wp.add_argument("args", nargs=argparse.REMAINDER, help="wp-cli arguments")
+
+    p_db = subparsers.add_parser("db", help="Database operations")
+    p_db_sub = p_db.add_subparsers(dest="db_command")
+    p_db_export = p_db_sub.add_parser("export", help="Export database")
+    p_db_export.add_argument("name")
+    p_db_import = p_db_sub.add_parser("import", help="Import database")
+    p_db_import.add_argument("name")
+    p_db_import.add_argument("file", help="SQL file path")
+
+    p_backup = subparsers.add_parser("backup", help="Backup a site (files + db)")
+    p_backup.add_argument("name")
+
+    p_ps = subparsers.add_parser("ps", help="Show containers for a site")
+    p_ps.add_argument("name")
+
+    p_port = subparsers.add_parser("port", help="Change site port")
+    p_port.add_argument("name")
+    p_port.add_argument("port", type=int, help="New port number")
+
     args = parser.parse_args()
-    if args.command == "create": create_site(args.name, args.port, getattr(args, "force_pull", False))
-    elif args.command == "delete": delete_site(args.name)
-    elif args.command == "start": start_site(args.name)
-    elif args.command == "stop": stop_site(args.name)
-    elif args.command == "list": list_sites()
+
+    if args.command == "create": cmd_create(args.name, args.port, args.force_pull)
+    elif args.command == "start": cmd_start(args.name)
+    elif args.command == "stop": cmd_stop(args.name)
+    elif args.command == "restart": cmd_restart(args.name)
+    elif args.command == "delete": cmd_delete(args.name)
+    elif args.command == "list": cmd_list()
+    elif args.command == "info": cmd_info(args.name)
+    elif args.command == "shell": cmd_shell(args.name, args.service)
+    elif args.command == "logs": cmd_logs(args.name, args.service, args.follow, args.lines)
+    elif args.command == "wp": cmd_wp(args.name, args.args)
+    elif args.command == "db":
+        if not hasattr(args, "db_command") or not args.db_command:
+            print("Usage: wordpress db {export|import} ...")
+            return
+        if args.db_command == "export": cmd_db_export(args.name)
+        elif args.db_command == "import": cmd_db_import(args.name, args.file)
+    elif args.command == "backup": cmd_backup(args.name)
+    elif args.command == "ps": cmd_ps(args.name)
+    elif args.command == "port": cmd_port(args.name, args.port)
     else: parser.print_help()
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
